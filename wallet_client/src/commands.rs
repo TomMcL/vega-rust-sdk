@@ -145,6 +145,8 @@ pub struct OrderSubmission {
     /// Used to specify the details for a pegged order
     /// - See `PeggedOrder`
     pub pegged_order: Option<PeggedOrder>,
+    pub post_only: bool,
+    pub reduce_only: bool,
 }
 /// An order cancellation is a request to cancel an existing order on Vega
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
