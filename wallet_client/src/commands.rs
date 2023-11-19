@@ -209,10 +209,6 @@ pub struct LiquidityProvisionSubmission {
     pub commitment_amount: String,
     /// Nominated liquidity fee factor, which is an input to the calculation of taker fees on the market, as per setting fees and rewarding liquidity providers
     pub fee: String,
-    /// A set of liquidity sell orders to meet the liquidity provision obligation
-    pub sells: Vec<LiquidityOrder>,
-    /// A set of liquidity buy orders to meet the liquidity provision obligation
-    pub buys: Vec<LiquidityOrder>,
     /// A reference to be added to every order created out of this liquidityProvisionSubmission
     pub reference: String,
 }
@@ -235,10 +231,6 @@ pub struct LiquidityProvisionAmendment {
     pub commitment_amount: String,
     /// an empty strings means no change
     pub fee: String,
-    /// empty slice means no change
-    pub sells: Vec<LiquidityOrder>,
-    /// empty slice means no change
-    pub buys: Vec<LiquidityOrder>,
     /// empty string means no change
     pub reference: String,
 }
