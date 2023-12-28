@@ -171,6 +171,16 @@ pub async fn run_pre_power(
                         search_block -= 1;
                     }
                 }
+                while to_send > 0 && available_pows.len() > 0 {
+                    let pow = available_pows.pop_back().unwrap();
+                    if pow.0 >= oldest_block {
+                        if let Err(e) = pow_sender.send(pow).await {
+                            error!("{}", e);
+                        } else {
+                            to_send -= 1;
+                        }
+                    }
+                }
                 gen_interval.reset();
             }
             Some(be) = block_end_stream.next() => {
