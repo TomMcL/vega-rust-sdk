@@ -276,23 +276,27 @@ impl Transact {
             Payload::Command(c) => self.sign(&c).await?,
             Payload::Transaction(tx) => tx,
         };
-        let resp = self
-            .client.lock().await
-            .submit_transaction(SubmitTransactionRequest {
-                tx: Some(tx),
-                r#type: submit_raw_transaction_request::Type::Async.into(),
-            })
-            .await?;
+        let resp;
+        info!("SENDING");
+        {
+            resp = self
+                .client.lock().await
+                .submit_transaction(SubmitTransactionRequest {
+                    tx: Some(tx),
+                    r#type: submit_raw_transaction_request::Type::Async.into(),
+                })
+                .await?.get_ref().to_owned();
+        }
 
-        let err = match resp.get_ref().success {
+        let err = match resp.success {
             true => None,
-            false => Some(resp.get_ref().data.to_string()),
+            false => Some(resp.data.to_string()),
         };
 
         return Ok(SendTxResult {
-            success: resp.get_ref().success,
-            hash: resp.get_ref().tx_hash.clone(),
-            code: resp.get_ref().code,
+            success: resp.success,
+            hash: resp.tx_hash.clone(),
+            code: resp.code,
             error: err,
         });
     }
