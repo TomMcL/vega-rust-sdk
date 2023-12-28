@@ -1,4 +1,5 @@
 use std::{time::Duration, collections::{HashMap, VecDeque}, sync::Arc};
+use chrono::Utc;
 use futures::lock::Mutex;
 
 use crypto::Signer;
@@ -34,7 +35,8 @@ pub struct Transact {
     signer: Signer,
     client: Arc<Mutex<CoreServiceClient<tonic::transport::Channel>>>,
     pow_req: Sender<bool>,
-    pow_recv: Arc<Mutex<Receiver<(u64, ProofOfWork)>>>
+    pow_recv: Arc<Mutex<Receiver<(u64, ProofOfWork)>>>,
+    chain_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +114,7 @@ pub async fn run_pre_power(
     let difficulty_step = spam_dets.spam_pow_number_of_tx_per_block as usize;
     let historic_blocks_to_keep = (spam_dets.spam_pow_number_of_past_blocks - 10) as usize;
 
-    let mut gen_interval = tokio::time::interval(Duration::from_millis(200));
+    let mut gen_interval = tokio::time::interval(Duration::from_millis(100));
 
     let mut used_blocks: HashMap<u64, usize> = HashMap::new();
     let mut block_hashes: HashMap<u64, String> = HashMap::new();
@@ -125,6 +127,20 @@ pub async fn run_pre_power(
 
     loop {
         tokio::select! {
+            _ = req_stream.next() => {
+                to_send += 1;
+                
+                while to_send > 0 && available_pows.len() > 0 {
+                    let pow = available_pows.pop_back().unwrap();
+                    if pow.0 >= oldest_block {
+                        if let Err(e) = pow_sender.send(pow).await {
+                            error!("{}", e);
+                        } else {
+                            to_send -= 1;
+                        }
+                    }
+                }
+            }
             _ = gen_interval.tick() => {
                 let mut search_block = latest_block;
                 while search_block >= oldest_block {
@@ -176,20 +192,6 @@ pub async fn run_pre_power(
                     }
                 }
             }
-            _ = req_stream.next() => {
-                to_send += 1;
-                
-                while to_send > 0 && available_pows.len() > 0 {
-                    let pow = available_pows.pop_back().unwrap();
-                    if pow.0 >= oldest_block {
-                        if let Err(e) = pow_sender.send(pow).await {
-                            error!("{}", e);
-                        } else {
-                            to_send -= 1;
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -219,6 +221,9 @@ impl Transact {
         let (pow_sender, pow_recv) = mpsc::channel(10);
 
         let client = Arc::new(Mutex::new(CoreServiceClient::connect(node_address).await?));
+        let res = client.lock().await
+        .last_block_height(LastBlockHeightRequest {})
+        .await?;
 
         tokio::spawn(
             run_pre_power(
@@ -229,17 +234,12 @@ impl Transact {
             )
         );
 
-        return Ok(Transact { signer, client, pow_req, pow_recv: Arc::new(Mutex::new(pow_recv)) });
+        return Ok(Transact { signer, client, pow_req, pow_recv: Arc::new(Mutex::new(pow_recv)), chain_id: res.get_ref().chain_id.to_string() });
     }
 
     pub async fn sign(&self, cmd: &Command) -> Result<Transaction, Error> {
         // first get the block infos
         self.pow_req.send(true).await.unwrap();
-
-        let mut locked = self.client.lock().await;
-        let res = locked
-            .last_block_height(LastBlockHeightRequest {})
-            .await?;
 
         let (height, pow) = self.pow_recv.lock().await.recv().await.unwrap().to_owned();
 
@@ -252,7 +252,7 @@ impl Transact {
 
         let signature = hex::encode(self.signer.sign(&build_signable_message(
             &input_data,
-            &res.get_ref().chain_id,
+            &self.chain_id,
         )));
 
         return Ok(Transaction {
@@ -280,7 +280,7 @@ impl Transact {
             .client.lock().await
             .submit_transaction(SubmitTransactionRequest {
                 tx: Some(tx),
-                r#type: submit_raw_transaction_request::Type::Sync.into(),
+                r#type: submit_raw_transaction_request::Type::Async.into(),
             })
             .await?;
 

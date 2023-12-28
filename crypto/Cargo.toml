@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 async-stream = "0.3.5"
 bip39 = {version = "2.0.0", features = ["rand"] }
+chrono = "0.4.31"
 ed25519-compact = "2.0.4"
 futures = "0.3.30"
 hex = "0.4.3"
