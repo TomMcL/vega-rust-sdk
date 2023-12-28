@@ -4,15 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-stream = "0.3.5"
 bip39 = {version = "2.0.0", features = ["rand"] }
 ed25519-compact = "2.0.4"
+futures = "0.3.30"
 hex = "0.4.3"
 hmac = "0.11.0"
+log = "0.4.20"
 prost = "0.12.3"
 rand = "0.8.5"
 regex = "1"
 sha2 = "0.9"
 sha3 = "0.10.8"
+tokio = "1"
+tokio-stream = "0.1.14"
 tonic = "0.10.2"
 vega_protobufs = { path = "../protobufs" }
 

@@ -1,17 +1,24 @@
+use std::{time::Duration, collections::{HashMap, VecDeque}, sync::Arc};
+use futures::lock::Mutex;
+
 use crypto::Signer;
 use errors::Error;
+use log::{error, info};
 use prost::Message;
 use rand::{thread_rng, Rng};
 use sha3::{Digest, Sha3_256};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio::sync::mpsc::{Receiver, Sender, self};
+use tonic::transport::Channel;
 use vega_protobufs::vega::{
     api::v1::{
         core_service_client::CoreServiceClient, submit_raw_transaction_request,
-        CheckTransactionRequest, LastBlockHeightRequest, SubmitTransactionRequest,
+        CheckTransactionRequest, LastBlockHeightRequest, SubmitTransactionRequest, ObserveEventBusRequest,
     },
     commands::v1::{
         input_data::Command, transaction::From as From_, InputData, ProofOfWork, Signature,
         Transaction, TxVersion,
-    },
+    }, events::v1::{BusEventType, bus_event::Event},
 };
 
 mod crypto;
@@ -25,7 +32,9 @@ const SIGNATURE_ALGORITHM: &str = "vega/ed25519";
 #[derive(Clone)]
 pub struct Transact {
     signer: Signer,
-    client: CoreServiceClient<tonic::transport::Channel>,
+    client: Arc<Mutex<CoreServiceClient<tonic::transport::Channel>>>,
+    pow_req: Sender<bool>,
+    pow_recv: Arc<Mutex<Receiver<(u64, ProofOfWork)>>>
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +76,124 @@ pub struct CheckTxResult {
     pub gas_used: i64,
 }
 
+pub async fn run_pre_power(
+    client: Arc<Mutex<CoreServiceClient<Channel>>>,
+    pow_request: Receiver<bool>,
+    pow_sender: Sender<(u64, ProofOfWork)>,
+    gen_per_block: usize,
+)
+{
+    let mut req_stream = ReceiverStream::new(pow_request);
+
+    let stream_req = async_stream::stream! {
+            yield ObserveEventBusRequest{
+            r#type: vec![BusEventType::BeginBlock.into()],
+            ..Default::default()
+        }
+    };
+
+    let mut block_end_stream;
+    let spam_dets;
+
+    {
+        let mut cl = client.lock().await;
+        block_end_stream = match cl.observe_event_bus(stream_req).await
+        {
+            Ok(s) => s.into_inner(),
+            Err(e) => panic!("{:?}", e),
+        };
+        spam_dets = cl
+            .last_block_height(LastBlockHeightRequest {})
+            .await
+            .unwrap().into_inner();
+    }
+
+    let difficulty = spam_dets.spam_pow_difficulty as usize;
+    let difficulty_step = spam_dets.spam_pow_number_of_tx_per_block as usize;
+    let historic_blocks_to_keep = (spam_dets.spam_pow_number_of_past_blocks - 10) as usize;
+
+    let mut gen_interval = tokio::time::interval(Duration::from_millis(200));
+
+    let mut used_blocks: HashMap<u64, usize> = HashMap::new();
+    let mut block_hashes: HashMap<u64, String> = HashMap::new();
+    let mut block_queue: VecDeque<u64> = VecDeque::new();
+    let mut available_pows: VecDeque<(u64, ProofOfWork)> = VecDeque::new();
+
+    let mut oldest_block: u64 = spam_dets.height;
+    let mut latest_block: u64 = spam_dets.height;
+    let mut to_send: u64 = 0;
+
+    loop {
+        tokio::select! {
+            _ = gen_interval.tick() => {
+                let mut search_block = latest_block;
+                while search_block >= oldest_block {
+                    let mut num_used = used_blocks.get(&search_block).unwrap_or(&gen_per_block).to_owned();
+                    if num_used < gen_per_block {
+                        while num_used < gen_per_block {
+
+                            let txid = random_hash();
+
+                            let (pow_nonce, _) = pow::solve(
+                                &block_hashes.get(&search_block).unwrap(),
+                                &txid,
+                                difficulty + num_used / difficulty_step,
+                            ).unwrap();
+
+                            available_pows.push_front((
+                                search_block.to_owned(),
+                                ProofOfWork {
+                                    tid: txid,
+                                    nonce: pow_nonce,
+                                }
+                            ));
+                            num_used += 1;
+                            used_blocks.insert(search_block, num_used);
+                        }
+                        break;
+                    } else {
+                        search_block -= 1;
+                    }
+                }
+                gen_interval.reset();
+            }
+            Some(be) = block_end_stream.next() => {
+                for evt in be.unwrap().events {
+                    match evt.event {
+                        Some(Event::BeginBlock(e)) => {
+                            latest_block = e.height;
+                            used_blocks.insert(e.height, 0);
+                            block_hashes.insert(e.height, e.hash);
+                            block_queue.push_front(e.height);
+                            if block_queue.len() > historic_blocks_to_keep {
+                                let to_rem = block_queue.pop_back().unwrap();
+                                used_blocks.remove(&to_rem);
+                                block_hashes.remove(&to_rem);
+                                oldest_block = block_queue.iter().last().unwrap().to_owned();
+                            }
+                        },
+                        _ => unreachable!(),
+                    }
+                }
+            }
+            _ = req_stream.next() => {
+                to_send += 1;
+                
+                while to_send > 0 && available_pows.len() > 0 {
+                    let pow = available_pows.pop_back().unwrap();
+                    if pow.0 >= oldest_block {
+                        if let Err(e) = pow_sender.send(pow).await {
+                            error!("{}", e);
+                        } else {
+                            to_send -= 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SendTxResult {
     pub success: bool,
@@ -76,9 +203,9 @@ pub struct SendTxResult {
 }
 
 impl Transact {
-    pub async fn new<'s, D>(creds: Credentials<'s>, node_address: D) -> Result<Transact, Error>
+    pub async fn new<'s, D>(creds: Credentials<'s>, node_address: D, gen_pows_per_block: usize) -> Result<Transact, Error>
     where
-        D: std::convert::TryInto<tonic::transport::Endpoint>,
+        D: std::convert::TryInto<tonic::transport::Endpoint> + std::marker::Send + Clone,
         D::Error: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
     {
         let signer = match creds {
@@ -88,28 +215,37 @@ impl Transact {
             }
         };
 
-        let client = CoreServiceClient::connect(node_address).await?;
-        return Ok(Transact { signer, client });
+        let (pow_req, pow_req_recv) = mpsc::channel(10);
+        let (pow_sender, pow_recv) = mpsc::channel(10);
+
+        let client = Arc::new(Mutex::new(CoreServiceClient::connect(node_address).await?));
+
+        tokio::spawn(
+            run_pre_power(
+                Arc::clone(&client),
+                pow_req_recv,
+                pow_sender,
+                gen_pows_per_block,
+            )
+        );
+
+        return Ok(Transact { signer, client, pow_req, pow_recv: Arc::new(Mutex::new(pow_recv)) });
     }
 
-    pub async fn sign(&mut self, cmd: &Command) -> Result<Transaction, Error> {
+    pub async fn sign(&self, cmd: &Command) -> Result<Transaction, Error> {
         // first get the block infos
-        let res = self
-            .client
+        self.pow_req.send(true).await.unwrap();
+
+        let mut locked = self.client.lock().await;
+        let res = locked
             .last_block_height(LastBlockHeightRequest {})
             .await?;
 
-        let txid = random_hash();
-
-        let (pow_nonce, _) = pow::solve(
-            &res.get_ref().hash,
-            &txid,
-            res.get_ref().spam_pow_difficulty as usize,
-        )?;
+        let (height, pow) = self.pow_recv.lock().await.recv().await.unwrap().to_owned();
 
         let input_data = InputData {
             nonce: gen_nonce(),
-            block_height: res.get_ref().height,
+            block_height: height,
             command: Some(cmd.clone()),
         }
         .encode_to_vec();
@@ -128,14 +264,11 @@ impl Transact {
                 algo: SIGNATURE_ALGORITHM.into(),
                 version: 1,
             }),
-            pow: Some(ProofOfWork {
-                tid: txid,
-                nonce: pow_nonce,
-            }),
+            pow: Some(pow),
         });
     }
 
-    pub async fn send<P>(&mut self, p: P) -> Result<SendTxResult, Error>
+    pub async fn send<P>(&self, p: P) -> Result<SendTxResult, Error>
     where
         P: Into<Payload>,
     {
@@ -144,7 +277,7 @@ impl Transact {
             Payload::Transaction(tx) => tx,
         };
         let resp = self
-            .client
+            .client.lock().await
             .submit_transaction(SubmitTransactionRequest {
                 tx: Some(tx),
                 r#type: submit_raw_transaction_request::Type::Sync.into(),
@@ -173,7 +306,7 @@ impl Transact {
             Payload::Transaction(tx) => tx,
         };
         let resp = self
-            .client
+            .client.lock().await
             .check_transaction(CheckTransactionRequest { tx: Some(tx) })
             .await?;
 
