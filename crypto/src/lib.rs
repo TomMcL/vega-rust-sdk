@@ -287,7 +287,6 @@ impl Transact {
             Payload::Transaction(tx) => tx,
         };
         let resp;
-        info!("SENDING");
         {
             resp = self
                 .client.lock().await
